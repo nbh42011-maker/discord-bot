@@ -37,12 +37,12 @@ def save_data(data):
         json.dump(data, f, indent=4)
 
 # ---------------- UTIL ----------------
-async def wait_for_guild(max_wait=30):
-    """Wait up to max_wait seconds for guild to appear in client's cache."""
+async def wait_for_guild(max_wait: int = 30):
     waited = 0
     while waited < max_wait:
-        if bot.get_guild(GUILD_ID):
-            return bot.get_guild(GUILD_ID)
+        g = bot.get_guild(GUILD_ID)
+        if g:
+            return g
         await asyncio.sleep(1)
         waited += 1
     return None
@@ -56,24 +56,44 @@ async def on_ready():
 
     guild = await wait_for_guild(max_wait=30)
     if not guild:
-        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds. Make sure bot is invited and TOKEN is correct.")
+        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds within timeout. Ensure the bot is invited and TOKEN is correct.")
         return
 
-    # Clear old guild commands (call sync-critical operations safely)
+    # Clear old guild commands (non-await call for this version)
     try:
-        # clear_commands is synchronous in this library version — do NOT await it
         bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
     except Exception:
-        # non-fatal: continue to sync attempt
         pass
 
     try:
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
         print("✅ Commands synced to guild.")
     except discord.Forbidden:
-        print("[ERROR] Missing Access while syncing commands. Ensure bot is invited with applications.commands and proper permissions.")
+        print("[ERROR] Missing Access while syncing commands. Ensure 'applications.commands' scope and bot permission in the server.")
     except Exception as e:
         print(f"[ERROR] Failed to sync commands: {e!r}")
+
+# ---------------- TREE ERROR HANDLER ----------------
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Silently handle CommandNotFound (occurs when interactions come to instance before sync)
+    if isinstance(error, app_commands.CommandNotFound):
+        try:
+            # polite ephemeral reply to user (if possible)
+            if interaction.response.is_done():
+                return
+            await interaction.response.send_message("⚠️ That command isn't available right now. Try again in a moment.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # Other errors: log concise info and show friendly message
+    print(f"[ERROR] App command error: {error!r}")
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An internal error occurred. Staff has been notified.", ephemeral=True)
+    except Exception:
+        pass
 
 # ---------------- BOOST LOOP ----------------
 @tasks.loop(minutes=5)
@@ -161,14 +181,14 @@ class GenDropdown(discord.ui.Select):
         item = stock.pop(0)
         save_data(data)
 
-        # Try to DM first; if DMs fail, send ephemeral
+        # DM preferred; fall back to ephemeral message
         try:
             await interaction.user.send(f"{'💎' if self.gen_type=='exclusive' else '🎉'} **Your {category} item:**\n```{item}```")
             await interaction.response.send_message("✅ Item sent to your DMs.", ephemeral=True)
         except Exception:
             await interaction.response.send_message(f"🎁 **Your {category} item:**\n```{item}```", ephemeral=True)
 
-        # Staff DM log (non-blocking)
+        # Notify staff via DM (best-effort)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"📤 {interaction.user} generated from `{category}` ({self.gen_type})")
@@ -187,9 +207,8 @@ async def gen(interaction: discord.Interaction):
 
 @bot.tree.command(name="exclusive-gen", guild=discord.Object(id=GUILD_ID))
 async def exclusive_gen(interaction: discord.Interaction):
-    # check exclusive role requirement
     member = interaction.user
-    if EXCLUSIVE_ROLE_ID not in [r.id for r in member.roles]:
+    if EXCLUSIVE_ROLE_ID not in [r.id for r in getattr(member, "roles", [])]:
         await interaction.response.send_message("❌ You need Exclusive access to use this command.", ephemeral=True)
         return
     await interaction.response.send_message("💎 **Select an Exclusive Category:**", view=GenView("exclusive"), ephemeral=True)
