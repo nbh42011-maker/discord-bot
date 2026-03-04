@@ -1,16 +1,15 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import os
-import json
-import time
+import os, json, time
+from typing import Optional
 
-# ================= CONFIG =================
-GUILD_ID = 1452717489656954961        # Your server ID
+# ---------------- CONFIG ----------------
+GUILD_ID = 1452717489656954961
 FREE_GEN_ROLE_ID = 1467913996723032315
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
-STAFF_NOTIFY_USER_ID = 884084052854984726  # Staff/owner to receive DMs
+STAFF_NOTIFY_USER_ID = 884084052854984726
 
 DATA_FILE = "stock.json"
 INVITE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
@@ -18,12 +17,12 @@ INVITE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
 FREE_COOLDOWN = 180       # 3 min
 EXCLUSIVE_COOLDOWN = 60   # 1 min
 
-# ==========================================
+# ---------------- INTENTS ----------------
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 cooldowns = {"free": {}, "exclusive": {}}
 
-# ---------------- DATA MANAGEMENT ----------------
+# ---------------- DATA ----------------
 def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
@@ -39,12 +38,7 @@ def save_data(data):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name=INVITE_TEXT
-        )
-    )
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=INVITE_TEXT))
     boost_loop.start()
     await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
 
@@ -54,10 +48,8 @@ async def boost_loop():
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return
-
     boost_role = guild.get_role(BOOST_ROLE_ID)
     exclusive_role = guild.get_role(EXCLUSIVE_ROLE_ID)
-
     for member in guild.members:
         try:
             if member.premium_since:
@@ -76,17 +68,16 @@ async def boost_loop():
 # ---------------- AUTOCOMPLETE ----------------
 async def category_autocomplete(interaction, current):
     data = load_data()
-    return [app_commands.Choice(name=cat, value=cat)
-            for cat in data["categories"] if current.lower() in cat.lower()][:25]
+    return [app_commands.Choice(name=cat, value=cat) for cat in data["categories"] if current.lower() in cat.lower()][:25]
 
 async def type_autocomplete(interaction, current):
     types = ["free", "exclusive"]
     return [app_commands.Choice(name=t.capitalize(), value=t) for t in types if current.lower() in t.lower()]
 
-# ---------------- COOLDOWN CHECK ----------------
+# ---------------- COOLDOWN ----------------
 def check_cooldown(user_id, gen_type):
     now = time.time()
-    cd_time = FREE_COOLDOWN if gen_type == "free" else EXCLUSIVE_COOLDOWN
+    cd_time = FREE_COOLDOWN if gen_type=="free" else EXCLUSIVE_COOLDOWN
     last = cooldowns[gen_type].get(user_id, 0)
     remaining = cd_time - (now - last)
     if remaining > 0:
@@ -109,11 +100,11 @@ def format_stock_embed():
     embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
-# ---------------- GEN VIEW ----------------
+# ---------------- GEN VIEWS ----------------
 class GenDropdown(discord.ui.Select):
     def __init__(self, gen_type):
         data = load_data()
-        options = []
+        options=[]
         for category, items in data[gen_type].items():
             count = len(items)
             label = f"{category} — {count}" if count else f"{category} — 0 (Out of Stock)"
@@ -135,11 +126,6 @@ class GenDropdown(discord.ui.Select):
         item = stock.pop(0)
         save_data(data)
         await interaction.response.send_message(f"🎁 **Your {category} account:**\n```{item}```", ephemeral=True)
-        try:
-            staff_user = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
-            await staff_user.send(f"📤 {interaction.user} generated from `{category}` ({self.gen_type})")
-        except:
-            pass
 
 class GenView(discord.ui.View):
     def __init__(self, gen_type):
@@ -186,57 +172,77 @@ async def remove_category(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(name="addstock", guild=discord.Object(id=GUILD_ID))
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-async def addstock(interaction: discord.Interaction, type: str, category: str, stock: str):
-    type = type.lower()
+async def addstock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
     data = load_data()
+    type = type.lower()
     if category not in data[type]:
         await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
         return
-    items = [x.strip() for x in stock.split("\n") if x.strip()]
+
+    items = []
+    if file:
+        f = await file.read()
+        items = [line.strip() for line in f.decode().split("\n") if line.strip()]
+    elif stock:
+        items = [line.strip() for line in stock.split("\n") if line.strip()]
+    else:
+        await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
+        return
+
     data[type][category].extend(items)
     save_data(data)
-    await interaction.response.send_message(f"✅ Added {len(items)} stock to `{category}`.", ephemeral=True)
-    role_id = FREE_GEN_ROLE_ID if type == "free" else EXCLUSIVE_ROLE_ID
+    await interaction.response.send_message(f"✅ Added {len(items)} items to `{category}`.", ephemeral=True)
+
+    role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
     if role:
         await interaction.channel.send(f"{role.mention} 🔔 `{category}` restocked!")
 
 @bot.tree.command(name="restock", guild=discord.Object(id=GUILD_ID))
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-async def restock(interaction: discord.Interaction, type: str, category: str, stock: str):
-    type = type.lower()
+async def restock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
     data = load_data()
-    items = [x.strip() for x in stock.split("\n") if x.strip()]
+    type = type.lower()
+    if category not in data[type]:
+        await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
+        return
+
+    items = []
+    if file:
+        f = await file.read()
+        items = [line.strip() for line in f.decode().split("\n") if line.strip()]
+    elif stock:
+        items = [line.strip() for line in stock.split("\n") if line.strip()]
+    else:
+        await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
+        return
+
     data[type][category] = items
     save_data(data)
     await interaction.response.send_message(f"♻️ `{category}` fully restocked with {len(items)} items.", ephemeral=True)
-    role_id = FREE_GEN_ROLE_ID if type == "free" else EXCLUSIVE_ROLE_ID
+
+    role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
     if role:
         await interaction.channel.send(f"{role.mention} 🚀 `{category}` fully restocked!")
 
 # ---------------- REDEEM EXCLUSIVE ----------------
 class RedeemModal(discord.ui.Modal, title="💎 Redeem Exclusive Gift Card"):
-    payment_type = discord.ui.TextInput(label="Enter Payment Type")
-    code = discord.ui.TextInput(label="Enter Gift Card Code")
+    payment_type = discord.ui.TextInput(label="Payment Type")
+    code = discord.ui.TextInput(label="Gift Card Code")
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             staff_user = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
-            await staff_user.send(
-                f"💳 Redeem request from {interaction.user}\nType: {self.payment_type.value}\nCode: `{self.code.value}`"
-            )
+            await staff_user.send(f"💳 Redeem request from {interaction.user}\nType: {self.payment_type.value}\nCode: `{self.code.value}`")
         except:
             pass
-        await interaction.response.send_message(
-            "✅ Your code has been submitted via DM for verification. Once verified, you will receive Exclusive access.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("✅ Your code has been submitted via DM for verification. Once verified, you will receive Exclusive access.", ephemeral=True)
 
 @bot.tree.command(name="redeem-exclusive", guild=discord.Object(id=GUILD_ID))
 async def redeem_exclusive(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- RUN BOT ----------------
+# ---------------- RUN ----------------
 TOKEN = os.getenv("TOKEN")
 bot.run(TOKEN)
