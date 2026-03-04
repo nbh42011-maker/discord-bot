@@ -22,7 +22,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 cooldowns = {"free": {}, "exclusive": {}}
 
-# ---------------- DATA ----------------
+# ---------------- DATA MANAGEMENT ----------------
 def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
@@ -179,19 +179,25 @@ async def addstock(interaction: discord.Interaction, type: str, category: str, s
         await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
         return
 
-    items = []
+    new_items = []
     if file:
         f = await file.read()
-        items = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        lines = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        for line in lines:
+            if line not in data[type][category]:
+                new_items.append(line)
     elif stock:
-        items = [line.strip() for line in stock.split("\n") if line.strip()]
+        lines = [line.strip() for line in stock.split("\n") if line.strip()]
+        for line in lines:
+            if line not in data[type][category]:
+                new_items.append(line)
     else:
         await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
         return
 
-    data[type][category].extend(items)
+    data[type][category].extend(new_items)
     save_data(data)
-    await interaction.response.send_message(f"✅ Added {len(items)} items to `{category}`.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Added {len(new_items)} new items to `{category}`.", ephemeral=True)
 
     role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
@@ -207,19 +213,21 @@ async def restock(interaction: discord.Interaction, type: str, category: str, st
         await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
         return
 
-    items = []
+    new_items = []
     if file:
         f = await file.read()
-        items = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        lines = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        new_items = list(dict.fromkeys(lines))
     elif stock:
-        items = [line.strip() for line in stock.split("\n") if line.strip()]
+        lines = [line.strip() for line in stock.split("\n") if line.strip()]
+        new_items = list(dict.fromkeys(lines))
     else:
         await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
         return
 
-    data[type][category] = items
+    data[type][category] = new_items
     save_data(data)
-    await interaction.response.send_message(f"♻️ `{category}` fully restocked with {len(items)} items.", ephemeral=True)
+    await interaction.response.send_message(f"♻️ `{category}` fully restocked with {len(new_items)} items.", ephemeral=True)
 
     role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
