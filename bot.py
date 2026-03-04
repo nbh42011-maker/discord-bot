@@ -1,3 +1,5 @@
+# bot.py
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -34,16 +36,56 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# ---------------- READY & COMMAND SYNC ----------------
+# ---------------- UTIL ----------------
+async def wait_for_guild(max_wait=30):
+    """Wait up to max_wait seconds for guild to appear in client's guilds."""
+    waited = 0
+    while waited < max_wait:
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            return guild
+        await asyncio.sleep(1)
+        waited += 1
+    return None
+
+# ---------------- READY & ROBUST SYNC ----------------
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=INVITE_TEXT))
     boost_loop.start()
-    # Force guild command sync
-    guild = discord.Object(id=GUILD_ID)
-    await bot.tree.sync(guild=guild)
-    print("✅ Commands synced to your guild!")
+
+    # Wait for guild to show up in cache
+    guild = await wait_for_guild(max_wait=30)
+    if not guild:
+        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds within timeout. "
+              "Make sure bot is invited to the server and scopes include applications.commands.")
+        return
+
+    # Try to clear old guild commands and sync. Retry on transient issues.
+    retries = 5
+    delay = 1
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[SYNC] Clearing old guild commands (attempt {attempt})...")
+            await bot.tree.clear_commands(guild=guild)  # clear remnants
+            print("[SYNC] Registering commands to guild...")
+            await bot.tree.sync(guild=guild)
+            print("✅ Commands cleared & synced to your guild!")
+            break
+        except discord.Forbidden:
+            # Missing access usually means bot token lacks access to that guild or bot not in guild
+            print("[ERROR] Forbidden while syncing commands (Missing Access).")
+            print(" - Make sure the bot is invited with scopes 'bot' and 'applications.commands'.")
+            print(" - Make sure the token is correct and the bot is still in that server.")
+            # don't spam; break so operator can fix
+            break
+        except Exception as e:
+            print(f"[WARN] Sync attempt {attempt} failed: {e!r}. Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+            delay *= 2
+    else:
+        print("[ERROR] Failed to sync commands after retries. Check permissions & that bot is in guild.")
 
 # ---------------- BOOST LOOP ----------------
 @tasks.loop(minutes=5)
@@ -56,31 +98,31 @@ async def boost_loop():
     for member in guild.members:
         try:
             if member.premium_since:
-                if boost_role not in member.roles:
+                if boost_role and boost_role not in member.roles:
                     await member.add_roles(boost_role)
                 if exclusive_role and exclusive_role not in member.roles:
                     await member.add_roles(exclusive_role)
             else:
-                if boost_role in member.roles:
+                if boost_role and boost_role in member.roles:
                     await member.remove_roles(boost_role)
                 if exclusive_role and exclusive_role in member.roles:
                     await member.remove_roles(exclusive_role)
-        except:
+        except Exception:
             continue
 
 # ---------------- AUTOCOMPLETE ----------------
-async def category_autocomplete(interaction, current):
+async def category_autocomplete(interaction: discord.Interaction, current: str):
     data = load_data()
     return [app_commands.Choice(name=cat, value=cat) for cat in data["categories"] if current.lower() in cat.lower()][:25]
 
-async def type_autocomplete(interaction, current):
+async def type_autocomplete(interaction: discord.Interaction, current: str):
     types = ["free", "exclusive"]
     return [app_commands.Choice(name=t.capitalize(), value=t) for t in types if current.lower() in t.lower()]
 
 # ---------------- COOLDOWN ----------------
 def check_cooldown(user_id, gen_type):
     now = time.time()
-    cd_time = FREE_COOLDOWN if gen_type=="free" else EXCLUSIVE_COOLDOWN
+    cd_time = FREE_COOLDOWN if gen_type == "free" else EXCLUSIVE_COOLDOWN
     last = cooldowns[gen_type].get(user_id, 0)
     remaining = cd_time - (now - last)
     if remaining > 0:
@@ -98,16 +140,16 @@ def format_stock_embed():
     excl_section = ""
     for cat, items in data["exclusive"].items():
         excl_section += f"**{cat}** → {len(items) if items else '0 (Out of Stock)'}\n"
-    embed.add_field(name="🆓 Free Stock", value=free_section if free_section else "No categories", inline=False)
-    embed.add_field(name="💎 Exclusive Stock", value=excl_section if excl_section else "No categories", inline=False)
+    embed.add_field(name="🆓 Free Stock", value=free_section or "No categories", inline=False)
+    embed.add_field(name="💎 Exclusive Stock", value=excl_section or "No categories", inline=False)
     embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
-# ---------------- GEN VIEW ----------------
+# ---------------- GEN VIEWS ----------------
 class GenDropdown(discord.ui.Select):
-    def __init__(self, gen_type):
+    def __init__(self, gen_type: str):
         data = load_data()
-        options=[]
+        options = []
         for category, items in data[gen_type].items():
             count = len(items)
             label = f"{category} — {count}" if count else f"{category} — 0 (Out of Stock)"
@@ -128,10 +170,18 @@ class GenDropdown(discord.ui.Select):
             return
         item = stock.pop(0)
         save_data(data)
-        await interaction.response.send_message(f"🎁 **Your {category} account:**\n```{item}```", ephemeral=True)
+        try:
+            await interaction.response.send_message(f"🎁 **Your {category} account:**\n```{item}```", ephemeral=True)
+        except Exception:
+            # fallback: try to DM
+            try:
+                await interaction.user.send(f"🎁 **Your {category} account:**\n```{item}```")
+                await interaction.response.send_message("✅ Item sent to your DMs.", ephemeral=True)
+            except Exception:
+                await interaction.response.send_message("❌ Could not deliver item. Check your DMs.", ephemeral=True)
 
 class GenView(discord.ui.View):
-    def __init__(self, gen_type):
+    def __init__(self, gen_type: str):
         super().__init__(timeout=60)
         self.add_item(GenDropdown(gen_type))
 
@@ -178,14 +228,17 @@ async def remove_category(interaction: discord.Interaction, name: str):
 async def addstock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
     data = load_data()
     type = type.lower()
+    if type not in ("free", "exclusive"):
+        await interaction.response.send_message("❌ Type must be 'free' or 'exclusive'.", ephemeral=True)
+        return
     if category not in data[type]:
         await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
         return
 
     new_items = []
     if file:
-        f = await file.read()
-        lines = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        content = await file.read()
+        lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
         for line in lines:
             if line not in data[type][category]:
                 new_items.append(line)
@@ -212,14 +265,17 @@ async def addstock(interaction: discord.Interaction, type: str, category: str, s
 async def restock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
     data = load_data()
     type = type.lower()
+    if type not in ("free", "exclusive"):
+        await interaction.response.send_message("❌ Type must be 'free' or 'exclusive'.", ephemeral=True)
+        return
     if category not in data[type]:
         await interaction.response.send_message("❌ Invalid category.", ephemeral=True)
         return
 
     new_items = []
     if file:
-        f = await file.read()
-        lines = [line.strip() for line in f.decode().split("\n") if line.strip()]
+        content = await file.read()
+        lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
         new_items = list(dict.fromkeys(lines))
     elif stock:
         lines = [line.strip() for line in stock.split("\n") if line.strip()]
@@ -246,7 +302,7 @@ class RedeemModal(discord.ui.Modal, title="💎 Redeem Exclusive Gift Card"):
         try:
             staff_user = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff_user.send(f"💳 Redeem request from {interaction.user}\nType: {self.payment_type.value}\nCode: `{self.code.value}`")
-        except:
+        except Exception:
             pass
         await interaction.response.send_message("✅ Your code has been submitted via DM for verification. Once verified, you will receive Exclusive access.", ephemeral=True)
 
@@ -256,4 +312,7 @@ async def redeem_exclusive(interaction: discord.Interaction):
 
 # ---------------- RUN ----------------
 TOKEN = os.getenv("TOKEN")
-bot.run(TOKEN)
+if not TOKEN:
+    print("[ERROR] TOKEN env var not set.")
+else:
+    bot.run(TOKEN)
