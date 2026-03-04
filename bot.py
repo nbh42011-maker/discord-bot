@@ -21,7 +21,6 @@ EXCLUSIVE_COOLDOWN = 60   # 1 min
 # ==========================================
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 cooldowns = {"free": {}, "exclusive": {}}
 
 # ---------------- DATA MANAGEMENT ----------------
@@ -61,16 +60,16 @@ async def boost_loop():
 
     for member in guild.members:
         try:
-            if member.premium_since:  # Member is boosting
+            if member.premium_since:
                 if boost_role not in member.roles:
                     await member.add_roles(boost_role)
                 if exclusive_role and exclusive_role not in member.roles:
-                    await member.add_roles(exclusive_role)  # Grant Exclusive
-            else:  # Member stopped boosting
+                    await member.add_roles(exclusive_role)
+            else:
                 if boost_role in member.roles:
                     await member.remove_roles(boost_role)
                 if exclusive_role and exclusive_role in member.roles:
-                    await member.remove_roles(exclusive_role)  # Remove Exclusive
+                    await member.remove_roles(exclusive_role)
         except:
             continue
 
@@ -136,7 +135,6 @@ class GenDropdown(discord.ui.Select):
         item = stock.pop(0)
         save_data(data)
         await interaction.response.send_message(f"🎁 **Your {category} account:**\n```{item}```", ephemeral=True)
-        # Staff DM logging
         try:
             staff_user = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff_user.send(f"📤 {interaction.user} generated from `{category}` ({self.gen_type})")
