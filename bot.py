@@ -22,7 +22,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 cooldowns = {"free": {}, "exclusive": {}}
 
-# ---------------- DATA MANAGEMENT ----------------
+# ---------------- DATA ----------------
 def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
@@ -34,13 +34,16 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# ---------------- PRESENCE & READY ----------------
+# ---------------- READY & COMMAND SYNC ----------------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=INVITE_TEXT))
     boost_loop.start()
-    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    # Force guild command sync
+    guild = discord.Object(id=GUILD_ID)
+    await bot.tree.sync(guild=guild)
+    print("✅ Commands synced to your guild!")
 
 # ---------------- BOOST LOOP ----------------
 @tasks.loop(minutes=5)
@@ -100,7 +103,7 @@ def format_stock_embed():
     embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
-# ---------------- GEN VIEWS ----------------
+# ---------------- GEN VIEW ----------------
 class GenDropdown(discord.ui.Select):
     def __init__(self, gen_type):
         data = load_data()
