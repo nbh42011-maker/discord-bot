@@ -16,8 +16,8 @@ STAFF_NOTIFY_USER_ID = 884084052854984726
 DATA_FILE = "stock.json"
 INVITE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
 
-FREE_COOLDOWN = 180       # 3 min
-EXCLUSIVE_COOLDOWN = 60   # 1 min
+FREE_COOLDOWN = 180       # 3 minutes
+EXCLUSIVE_COOLDOWN = 60   # 1 minute
 
 # ---------------- INTENTS ----------------
 intents = discord.Intents.all()
@@ -38,54 +38,42 @@ def save_data(data):
 
 # ---------------- UTIL ----------------
 async def wait_for_guild(max_wait=30):
-    """Wait up to max_wait seconds for guild to appear in client's guilds."""
+    """Wait up to max_wait seconds for guild to appear in client's cache."""
     waited = 0
     while waited < max_wait:
-        guild = bot.get_guild(GUILD_ID)
-        if guild:
-            return guild
+        if bot.get_guild(GUILD_ID):
+            return bot.get_guild(GUILD_ID)
         await asyncio.sleep(1)
         waited += 1
     return None
 
-# ---------------- READY & ROBUST SYNC ----------------
+# ---------------- READY & SYNC ----------------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=INVITE_TEXT))
     boost_loop.start()
 
-    # Wait for guild to show up in cache
     guild = await wait_for_guild(max_wait=30)
     if not guild:
-        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds within timeout. "
-              "Make sure bot is invited to the server and scopes include applications.commands.")
+        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds. Make sure bot is invited and TOKEN is correct.")
         return
 
-    # Try to clear old guild commands and sync. Retry on transient issues.
-    retries = 5
-    delay = 1
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"[SYNC] Clearing old guild commands (attempt {attempt})...")
-            await bot.tree.clear_commands(guild=guild)  # clear remnants
-            print("[SYNC] Registering commands to guild...")
-            await bot.tree.sync(guild=guild)
-            print("✅ Commands cleared & synced to your guild!")
-            break
-        except discord.Forbidden:
-            # Missing access usually means bot token lacks access to that guild or bot not in guild
-            print("[ERROR] Forbidden while syncing commands (Missing Access).")
-            print(" - Make sure the bot is invited with scopes 'bot' and 'applications.commands'.")
-            print(" - Make sure the token is correct and the bot is still in that server.")
-            # don't spam; break so operator can fix
-            break
-        except Exception as e:
-            print(f"[WARN] Sync attempt {attempt} failed: {e!r}. Retrying in {delay}s...")
-            await asyncio.sleep(delay)
-            delay *= 2
-    else:
-        print("[ERROR] Failed to sync commands after retries. Check permissions & that bot is in guild.")
+    # Clear old guild commands (call sync-critical operations safely)
+    try:
+        # clear_commands is synchronous in this library version — do NOT await it
+        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
+    except Exception:
+        # non-fatal: continue to sync attempt
+        pass
+
+    try:
+        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        print("✅ Commands synced to guild.")
+    except discord.Forbidden:
+        print("[ERROR] Missing Access while syncing commands. Ensure bot is invited with applications.commands and proper permissions.")
+    except Exception as e:
+        print(f"[ERROR] Failed to sync commands: {e!r}")
 
 # ---------------- BOOST LOOP ----------------
 @tasks.loop(minutes=5)
@@ -116,11 +104,11 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=cat, value=cat) for cat in data["categories"] if current.lower() in cat.lower()][:25]
 
 async def type_autocomplete(interaction: discord.Interaction, current: str):
-    types = ["free", "exclusive"]
-    return [app_commands.Choice(name=t.capitalize(), value=t) for t in types if current.lower() in t.lower()]
+    choices = ["free", "exclusive"]
+    return [app_commands.Choice(name=c.capitalize(), value=c) for c in choices if current.lower() in c.lower()]
 
 # ---------------- COOLDOWN ----------------
-def check_cooldown(user_id, gen_type):
+def check_cooldown(user_id: int, gen_type: str) -> int:
     now = time.time()
     cd_time = FREE_COOLDOWN if gen_type == "free" else EXCLUSIVE_COOLDOWN
     last = cooldowns[gen_type].get(user_id, 0)
@@ -150,7 +138,7 @@ class GenDropdown(discord.ui.Select):
     def __init__(self, gen_type: str):
         data = load_data()
         options = []
-        for category, items in data[gen_type].items():
+        for category, items in data.get(gen_type, {}).items():
             count = len(items)
             label = f"{category} — {count}" if count else f"{category} — 0 (Out of Stock)"
             options.append(discord.SelectOption(label=label[:100], value=category))
@@ -162,23 +150,30 @@ class GenDropdown(discord.ui.Select):
         if remaining > 0:
             await interaction.response.send_message(f"⏳ Slow down! Wait `{remaining}s` 🔥", ephemeral=True)
             return
+
         data = load_data()
         category = self.values[0]
-        stock = data[self.gen_type].get(category, [])
+        stock = data.get(self.gen_type, {}).get(category, [])
         if not stock:
             await interaction.response.send_message("⚠️ That category is out of stock.", ephemeral=True)
             return
+
         item = stock.pop(0)
         save_data(data)
+
+        # Try to DM first; if DMs fail, send ephemeral
         try:
-            await interaction.response.send_message(f"🎁 **Your {category} account:**\n```{item}```", ephemeral=True)
+            await interaction.user.send(f"{'💎' if self.gen_type=='exclusive' else '🎉'} **Your {category} item:**\n```{item}```")
+            await interaction.response.send_message("✅ Item sent to your DMs.", ephemeral=True)
         except Exception:
-            # fallback: try to DM
-            try:
-                await interaction.user.send(f"🎁 **Your {category} account:**\n```{item}```")
-                await interaction.response.send_message("✅ Item sent to your DMs.", ephemeral=True)
-            except Exception:
-                await interaction.response.send_message("❌ Could not deliver item. Check your DMs.", ephemeral=True)
+            await interaction.response.send_message(f"🎁 **Your {category} item:**\n```{item}```", ephemeral=True)
+
+        # Staff DM log (non-blocking)
+        try:
+            staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
+            await staff.send(f"📤 {interaction.user} generated from `{category}` ({self.gen_type})")
+        except Exception:
+            pass
 
 class GenView(discord.ui.View):
     def __init__(self, gen_type: str):
@@ -188,11 +183,16 @@ class GenView(discord.ui.View):
 # ---------------- USER COMMANDS ----------------
 @bot.tree.command(name="gen", guild=discord.Object(id=GUILD_ID))
 async def gen(interaction: discord.Interaction):
-    await interaction.response.send_message("📦 **Select a Category:**", view=GenView("free"), ephemeral=True)
+    await interaction.response.send_message("📦 **Select a Free Category:**", view=GenView("free"), ephemeral=True)
 
 @bot.tree.command(name="exclusive-gen", guild=discord.Object(id=GUILD_ID))
 async def exclusive_gen(interaction: discord.Interaction):
-    await interaction.response.send_message("💎 **Select Exclusive Category:**", view=GenView("exclusive"), ephemeral=True)
+    # check exclusive role requirement
+    member = interaction.user
+    if EXCLUSIVE_ROLE_ID not in [r.id for r in member.roles]:
+        await interaction.response.send_message("❌ You need Exclusive access to use this command.", ephemeral=True)
+        return
+    await interaction.response.send_message("💎 **Select an Exclusive Category:**", view=GenView("exclusive"), ephemeral=True)
 
 @bot.tree.command(name="stock", guild=discord.Object(id=GUILD_ID))
 async def stock(interaction: discord.Interaction):
@@ -225,7 +225,13 @@ async def remove_category(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(name="addstock", guild=discord.Object(id=GUILD_ID))
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-async def addstock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
+async def addstock(
+    interaction: discord.Interaction,
+    type: str,
+    category: str,
+    stock: Optional[str] = None,
+    file: Optional[discord.Attachment] = None
+):
     data = load_data()
     type = type.lower()
     if type not in ("free", "exclusive"):
@@ -238,7 +244,11 @@ async def addstock(interaction: discord.Interaction, type: str, category: str, s
     new_items = []
     if file:
         content = await file.read()
-        lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
+        try:
+            lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
+        except Exception:
+            await interaction.response.send_message("❌ Could not read attached file. Make sure it's a text file.", ephemeral=True)
+            return
         for line in lines:
             if line not in data[type][category]:
                 new_items.append(line)
@@ -248,21 +258,27 @@ async def addstock(interaction: discord.Interaction, type: str, category: str, s
             if line not in data[type][category]:
                 new_items.append(line)
     else:
-        await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
+        await interaction.response.send_message("❌ You must provide stock as text or attach a .txt file.", ephemeral=True)
         return
 
     data[type][category].extend(new_items)
     save_data(data)
     await interaction.response.send_message(f"✅ Added {len(new_items)} new items to `{category}`.", ephemeral=True)
 
-    role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
+    role_id = FREE_GEN_ROLE_ID if type == "free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
     if role:
         await interaction.channel.send(f"{role.mention} 🔔 `{category}` restocked!")
 
 @bot.tree.command(name="restock", guild=discord.Object(id=GUILD_ID))
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-async def restock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str]=None, file: Optional[discord.Attachment]=None):
+async def restock(
+    interaction: discord.Interaction,
+    type: str,
+    category: str,
+    stock: Optional[str] = None,
+    file: Optional[discord.Attachment] = None
+):
     data = load_data()
     type = type.lower()
     if type not in ("free", "exclusive"):
@@ -275,20 +291,24 @@ async def restock(interaction: discord.Interaction, type: str, category: str, st
     new_items = []
     if file:
         content = await file.read()
-        lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
+        try:
+            lines = [line.strip() for line in content.decode().splitlines() if line.strip()]
+        except Exception:
+            await interaction.response.send_message("❌ Could not read attached file. Make sure it's a text file.", ephemeral=True)
+            return
         new_items = list(dict.fromkeys(lines))
     elif stock:
         lines = [line.strip() for line in stock.split("\n") if line.strip()]
         new_items = list(dict.fromkeys(lines))
     else:
-        await interaction.response.send_message("❌ You must provide stock as text or a .txt file.", ephemeral=True)
+        await interaction.response.send_message("❌ You must provide stock as text or attach a .txt file.", ephemeral=True)
         return
 
     data[type][category] = new_items
     save_data(data)
     await interaction.response.send_message(f"♻️ `{category}` fully restocked with {len(new_items)} items.", ephemeral=True)
 
-    role_id = FREE_GEN_ROLE_ID if type=="free" else EXCLUSIVE_ROLE_ID
+    role_id = FREE_GEN_ROLE_ID if type == "free" else EXCLUSIVE_ROLE_ID
     role = interaction.guild.get_role(role_id)
     if role:
         await interaction.channel.send(f"{role.mention} 🚀 `{category}` fully restocked!")
