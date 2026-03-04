@@ -19,7 +19,7 @@ INVITE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
 FREE_COOLDOWN = 180       # 3 minutes
 EXCLUSIVE_COOLDOWN = 60   # 1 minute
 
-# ---------------- INTENTS ----------------
+# ---------------- INTENTS & BOT ----------------
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 cooldowns = {"free": {}, "exclusive": {}}
@@ -47,7 +47,7 @@ async def wait_for_guild(max_wait: int = 30):
         waited += 1
     return None
 
-# ---------------- READY & SYNC ----------------
+# ---------------- STARTUP & SYNC ----------------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
@@ -56,10 +56,10 @@ async def on_ready():
 
     guild = await wait_for_guild(max_wait=30)
     if not guild:
-        print(f"[ERROR] Guild {GUILD_ID} not found in bot.guilds within timeout. Ensure the bot is invited and TOKEN is correct.")
+        print(f"[ERROR] Guild {GUILD_ID} not in cache. Ensure bot invited with applications.commands scope & correct TOKEN.")
         return
 
-    # Clear old guild commands (non-await call for this version)
+    # Clear any old guild commands (non-await for compatibility)
     try:
         bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
     except Exception:
@@ -69,26 +69,43 @@ async def on_ready():
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
         print("✅ Commands synced to guild.")
     except discord.Forbidden:
-        print("[ERROR] Missing Access while syncing commands. Ensure 'applications.commands' scope and bot permission in the server.")
+        print("[ERROR] Missing Access while syncing commands. Ensure bot has applications.commands scope and is in the guild.")
     except Exception as e:
-        print(f"[ERROR] Failed to sync commands: {e!r}")
+        print(f"[ERROR] Sync failed: {e!r}")
 
-# ---------------- TREE ERROR HANDLER ----------------
+# ---------------- AUTOMATIC RESYNC ON MISSING COMMAND ----------------
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Silently handle CommandNotFound (occurs when interactions come to instance before sync)
+    # If command not found, attempt a quick guild re-sync once
     if isinstance(error, app_commands.CommandNotFound):
         try:
-            # polite ephemeral reply to user (if possible)
-            if interaction.response.is_done():
-                return
-            await interaction.response.send_message("⚠️ That command isn't available right now. Try again in a moment.", ephemeral=True)
+            guild = await wait_for_guild(max_wait=5)
+            if guild:
+                try:
+                    await bot.tree.sync(guild=guild)
+                    # notify user politely
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "⚠️ Commands were out of sync — I attempted to fix it. Please try again now.",
+                            ephemeral=True
+                        )
+                        return
+                except Exception:
+                    # fall through to generic message
+                    pass
+        except Exception:
+            pass
+
+        # final fallback message
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("⚠️ That command isn't available right now. Try again in a moment.", ephemeral=True)
         except Exception:
             pass
         return
 
-    # Other errors: log concise info and show friendly message
-    print(f"[ERROR] App command error: {error!r}")
+    # For everything else, log and notify (concise)
+    print(f"[ERROR] AppCommandError: {error!r}")
     try:
         if not interaction.response.is_done():
             await interaction.response.send_message("An internal error occurred. Staff has been notified.", ephemeral=True)
@@ -181,14 +198,13 @@ class GenDropdown(discord.ui.Select):
         item = stock.pop(0)
         save_data(data)
 
-        # DM preferred; fall back to ephemeral message
         try:
             await interaction.user.send(f"{'💎' if self.gen_type=='exclusive' else '🎉'} **Your {category} item:**\n```{item}```")
             await interaction.response.send_message("✅ Item sent to your DMs.", ephemeral=True)
         except Exception:
             await interaction.response.send_message(f"🎁 **Your {category} item:**\n```{item}```", ephemeral=True)
 
-        # Notify staff via DM (best-effort)
+        # staff DM (best effort)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
             await staff.send(f"📤 {interaction.user} generated from `{category}` ({self.gen_type})")
