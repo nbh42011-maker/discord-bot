@@ -1,4 +1,4 @@
-# bot.py
+# bot.py — Final Stable Build (full features)
 import os
 import json
 import time
@@ -9,123 +9,140 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from typing import Optional, List
 
-# ---------------- CONFIG (edit only IDs if they change) ----------------
-GUILD_ID = 1452717489656954961        # your guild
+# ---------------- CONFIG ----------------
+GUILD_ID = 1452717489656954961        # your server ID
 FREE_GEN_ROLE_ID = 1467913996723032315
 EXCLUSIVE_ROLE_ID = 1453906576237924603
 BOOST_ROLE_ID = 1453187878061478019
-ADMIN_ROLE_ID = 1452719764119093388   # admin role for command restrictions
+ADMIN_ROLE_ID = 1452719764119093388   # admin role for privileged commands
 STAFF_NOTIFY_USER_ID = 884084052854984726
+RESTOCK_CHANNEL_ID = 1478792670049599618  # dedicated restock channel
 
 STOCK_FILE = "stock.json"
 PRESENCE_TEXT = ".gg/nV3x85Jeq | BEST DROPS + GEN IN DISCORD"
 
-FREE_COOLDOWN = 180     # seconds
-EXCL_COOLDOWN = 60      # seconds
+FREE_COOLDOWN = 180   # seconds (3 minutes)
+EXCL_COOLDOWN = 60    # seconds (1 minute)
+
+RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual /resync-commands runs
 
 # ---------------- BOT / INTENTS ----------------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ---------------- STORAGE & LOCK ----------------
 _file_lock = asyncio.Lock()
 
-def _ensure_stock():
+def ensure_stock_file():
     if not os.path.exists(STOCK_FILE):
         with open(STOCK_FILE, "w") as f:
             json.dump({"FREE": {}, "EXCLUSIVE": {}, "categories": []}, f, indent=4)
 
-def load_stock():
-    _ensure_stock()
+def load_stock_from_disk():
+    ensure_stock_file()
     with open(STOCK_FILE, "r") as f:
         return json.load(f)
 
-def save_stock(data):
+def save_stock_to_disk(data):
     with open(STOCK_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# in-memory cache (kept consistent with file using lock)
-stock_data = load_stock()
-
-# ---------------- COOLDOWNS & RESYNC GUARD ----------------
-_cooldowns = {}  # { (user_id, "FREE"|"EXCLUSIVE") : timestamp }
-_last_resync = 0
-_RESYNC_COOLDOWN = 60 * 60  # 1 hour between manual resyncs to avoid rate limits
-
-# ---------------- HELPERS ----------------
-def now_ts():
-    return time.time()
+# in-memory cached stock (kept consistent with file using lock)
+stock_data = load_stock_from_disk()
 
 async def safe_load_stock():
     global stock_data
     async with _file_lock:
-        stock_data = load_stock()
+        stock_data = load_stock_from_disk()
         return stock_data
 
 async def safe_save_stock():
     async with _file_lock:
-        save_stock(stock_data)
+        save_stock_to_disk(stock_data)
 
-def check_cooldown_line(user_id: int, typ: str):
+# ---------------- COOLDOWNS / RESYNC GUARD ----------------
+_cooldowns = {}  # {(user_id, "FREE"|"EXCLUSIVE"): timestamp}
+_last_resync_ts = 0
+
+def now_ts():
+    return time.time()
+
+def check_cooldown(user_id: int, typ: str) -> int:
+    """Return remaining seconds or 0 if none."""
     key = (user_id, typ)
-    ts = _cooldowns.get(key, 0)
+    last = _cooldowns.get(key, 0)
     limit = FREE_COOLDOWN if typ == "FREE" else EXCL_COOLDOWN
-    rem = int(limit - (now_ts() - ts)) if now_ts() - ts < limit else 0
-    return rem
+    remaining = int(limit - (now_ts() - last)) if now_ts() - last < limit else 0
+    return remaining
 
 def set_cooldown(user_id: int, typ: str):
     _cooldowns[(user_id, typ)] = now_ts()
 
+# ---------------- ADMIN CHECK DECORATOR ----------------
+def is_admin_check():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        # ensure this runs in-guild and user has admin role
+        user = interaction.user
+        if not hasattr(user, "roles"):
+            return False
+        return any(r.id == ADMIN_ROLE_ID for r in getattr(user, "roles", []))
+    return app_commands.check(predicate)
+
+# ---------------- AUTOCOMPLETE ----------------
+async def category_autocomplete(interaction: discord.Interaction, current: str):
+    await safe_load_stock()
+    cats = stock_data.get("categories", [])
+    return [app_commands.Choice(name=c, value=c) for c in cats if current.lower() in c.lower()][:25]
+
+async def type_autocomplete(interaction: discord.Interaction, current: str):
+    options = ["free", "exclusive"]
+    return [app_commands.Choice(name=o.capitalize(), value=o) for o in options if current.lower() in o.lower()][:25]
+
+# ---------------- UTIL / FORMATTING ----------------
 def format_stock_embed():
     data = stock_data
     embed = discord.Embed(title="📦 Marcos Gen • Stock Overview", color=discord.Color.blue())
     free_lines = []
-    for cat in data.get("categories", []):
-        free_lines.append(f"**{cat}** → {len(data['FREE'].get(cat, []))}")
     excl_lines = []
     for cat in data.get("categories", []):
-        excl_lines.append(f"**{cat}** → {len(data['EXCLUSIVE'].get(cat, []))}")
+        free_lines.append(f"**{cat}** → {len(data.get('FREE', {}).get(cat, []))}")
+        excl_lines.append(f"**{cat}** → {len(data.get('EXCLUSIVE', {}).get(cat, []))}")
     embed.add_field(name="🆓 Free Stock", value="\n".join(free_lines) or "No categories", inline=False)
     embed.add_field(name="💎 Exclusive Stock", value="\n".join(excl_lines) or "No categories", inline=False)
     embed.set_footer(text="Professional • Secure • Automated")
     return embed
 
 def user_has_required_status(member: discord.Member) -> bool:
-    for act in member.activities:
+    # best-effort check for custom status; use /verify for reliability
+    for act in getattr(member, "activities", []):
         if isinstance(act, discord.CustomActivity) and act.name:
             if PRESENCE_TEXT.lower() in act.name.lower():
                 return True
     return False
 
-# ---------------- AUTOCOMPLETE HELPERS ----------------
-async def category_autocomplete(interaction: discord.Interaction, current: str):
-    await safe_load_stock()
-    choices = []
-    for cat in stock_data.get("categories", []):
-        if current.lower() in cat.lower():
-            choices.append(app_commands.Choice(name=cat, value=cat))
-    return choices[:25]
-
-async def type_autocomplete(interaction: discord.Interaction, current: str):
-    options = ["free", "exclusive"]
-    return [app_commands.Choice(name=o.capitalize(), value=o) for o in options if current.lower() in o.lower()][:25]
-
-# ---------------- STARTUP (do NOT sync automatically) ----------------
+# ---------------- STARTUP (no auto-sync) ----------------
 @bot.event
 async def on_ready():
-    # Do NOT call tree.sync() here to avoid rate-limit on repeated restarts.
-    # Commands should be registered once with a registrar or use /resync-commands manually (admin).
+    # Do not auto-sync commands on startup to avoid rate-limits from repeated deploys.
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=PRESENCE_TEXT))
-    boost_loop.start()
+    boost_check_loop.start()
 
-# ---------------- ERROR HANDLER ----------------
+# ---------------- GLOBAL APP COMMAND ERROR HANDLER ----------------
 @bot.tree.error
-async def global_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # If command isn't registered on this instance -> politely tell user, and avoid stack traces
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Handle missing permissions cleanly
+    if isinstance(error, app_commands.MissingRole):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        except Exception:
+            pass
+        return
     if isinstance(error, app_commands.CommandNotFound):
         try:
             if not interaction.response.is_done():
@@ -133,17 +150,24 @@ async def global_app_command_error(interaction: discord.Interaction, error: app_
         except Exception:
             pass
         return
-    # Fallback: send concise message and log
+
+    # Fallback: show friendly message, log error
     print(f"[AppCommandError] {error!r}")
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message("An error occurred while processing the command.", ephemeral=True)
+            await interaction.response.send_message("An unexpected error occurred while processing the command. Staff has been notified.", ephemeral=True)
+    except Exception:
+        pass
+    # notify staff (best-effort)
+    try:
+        staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
+        await staff.send(f"[Error] User {interaction.user} triggered an error: {error!r}")
     except Exception:
         pass
 
-# ---------------- BOOST AUTO-ROLE ----------------
+# ---------------- BOOST CHECK LOOP ----------------
 @tasks.loop(minutes=5)
-async def boost_loop():
+async def boost_check_loop():
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return
@@ -167,7 +191,7 @@ async def boost_loop():
 # ---------------- GEN UI ----------------
 class GenSelect(discord.ui.Select):
     def __init__(self, typ: str):
-        # typ: "FREE" or "EXCLUSIVE"
+        # typ is "FREE" or "EXCLUSIVE"
         opts = []
         for cat in stock_data.get("categories", []):
             cnt = len(stock_data.get(typ, {}).get(cat, []))
@@ -177,33 +201,31 @@ class GenSelect(discord.ui.Select):
         self.typ = typ
 
     async def callback(self, interaction: discord.Interaction):
-        # heavy work - defer
+        # heavy work — defer
         await interaction.response.defer(ephemeral=True)
-        cat = self.values[0]
-        # check stock & cooldown
         await safe_load_stock()
+        cat = self.values[0]
         items = stock_data.get(self.typ, {}).get(cat, [])
         if not items:
             await interaction.followup.send("⚠️ That category is out of stock.", ephemeral=True)
             return
-        rem = check_cooldown_line(interaction.user.id, self.typ)
+        rem = check_cooldown(interaction.user.id, self.typ)
         if rem > 0:
-            await interaction.followup.send(f"⏳ Wait {rem}s before generating again.", ephemeral=True)
+            await interaction.followup.send(f"⏳ Please wait {rem}s before generating again.", ephemeral=True)
             return
-        # pop and save
         item = items.pop(0)
         await safe_save_stock()
         set_cooldown(interaction.user.id, self.typ)
-        # try DM
+        # Try DM first
         try:
             await interaction.user.send(f"{'💎' if self.typ == 'EXCLUSIVE' else '🎉'} **Here is your item from {cat}:**\n```{item}```")
             await interaction.followup.send("✅ Sent to your DMs.", ephemeral=True)
         except Exception:
             await interaction.followup.send(f"🎁 **Here is your item from {cat}:**\n```{item}```", ephemeral=True)
-        # staff log best-effort
+        # staff log
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
-            await staff.send(f"Generated: user={interaction.user} type={self.typ} category={cat}")
+            await staff.send(f"[Generate] {interaction.user} got item from {cat} ({self.typ})")
         except Exception:
             pass
 
@@ -214,40 +236,40 @@ class GenView(discord.ui.View):
 
 # ---------------- USER COMMANDS ----------------
 @tree.command(name="gen", description="Generate a Free item")
-async def slash_gen(interaction: discord.Interaction):
-    # require custom status on user
+async def cmd_gen(interaction: discord.Interaction):
+    # Prefer /verify for stable role granting; we still check for presence informatively
     if not user_has_required_status(interaction.user):
-        await interaction.response.send_message(f"❌ Set your custom status to:\n`{PRESENCE_TEXT}`", ephemeral=True)
+        # instruct user to /verify
+        await interaction.response.send_message(
+            ("❌ Free Gen requires the custom status to be set.\n"
+             "Please set your custom status to include:\n"
+             f"`{PRESENCE_TEXT}`\n\n"
+             "Then run `/verify` to get Free access."),
+            ephemeral=True
+        )
         return
     await safe_load_stock()
-    await interaction.response.send_message("Select a Free category:", view=GenView("FREE"), ephemeral=True)
+    await interaction.response.send_message("📦 Select a Free category:", view=GenView("FREE"), ephemeral=True)
 
 @tree.command(name="exclusive-gen", description="Generate an Exclusive item")
-async def slash_exclusive_gen(interaction: discord.Interaction):
-    # check role
+async def cmd_exclusive_gen(interaction: discord.Interaction):
+    # require exclusive role
     if EXCLUSIVE_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
         await interaction.response.send_message("❌ You need the Exclusive role to use this command.", ephemeral=True)
         return
     await safe_load_stock()
-    await interaction.response.send_message("Select an Exclusive category:", view=GenView("EXCLUSIVE"), ephemeral=True)
+    await interaction.response.send_message("💎 Select an Exclusive category:", view=GenView("EXCLUSIVE"), ephemeral=True)
 
 @tree.command(name="stock", description="View current stock")
-async def slash_stock(interaction: discord.Interaction):
+async def cmd_stock(interaction: discord.Interaction):
     await safe_load_stock()
-    await interaction.response.send_message(embed=format_stock_embed(), ephemeral=True)
-
-# ---------------- ADMIN HELPERS ----------------
-def admin_check(interaction: discord.Interaction) -> bool:
-    return any(r.id == ADMIN_ROLE_ID for r in getattr(interaction.user, "roles", []))
-
-def admin_check_predicate(interaction: discord.Interaction) -> None:
-    if not admin_check(interaction):
-        raise app_commands.MissingRole(ADMIN_ROLE_ID)
+    embed = format_stock_embed()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------- ADMIN COMMANDS ----------------
 @tree.command(name="addcategory", description="Add a category (Admin only)")
-@app_commands.check(admin_check_predicate)
-async def slash_addcategory(interaction: discord.Interaction, category: str):
+@is_admin_check()
+async def cmd_addcategory(interaction: discord.Interaction, category: str):
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
     if category in stock_data.get("categories", []):
@@ -260,8 +282,8 @@ async def slash_addcategory(interaction: discord.Interaction, category: str):
     await interaction.followup.send(f"✅ Category `{category}` added.", ephemeral=True)
 
 @tree.command(name="removecategory", description="Remove a category (Admin only)")
-@app_commands.check(admin_check_predicate)
-async def slash_removecategory(interaction: discord.Interaction, category: str):
+@is_admin_check()
+async def cmd_removecategory(interaction: discord.Interaction, category: str):
     await interaction.response.defer(ephemeral=True)
     await safe_load_stock()
     if category not in stock_data.get("categories", []):
@@ -274,27 +296,27 @@ async def slash_removecategory(interaction: discord.Interaction, category: str):
     await interaction.followup.send(f"✅ Category `{category}` removed.", ephemeral=True)
 
 @tree.command(name="addstock", description="Add stock (Admin only)")
+@is_admin_check()
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-@app_commands.check(admin_check_predicate)
-async def slash_addstock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str] = None, file: Optional[discord.Attachment] = None):
+async def cmd_addstock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str] = None, file: Optional[discord.Attachment] = None):
     await interaction.response.defer(ephemeral=True)
-    type = type.lower()
-    if type not in ("free", "exclusive"):
+    t = type.lower()
+    if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
+    key = "FREE" if t == "free" else "EXCLUSIVE"
     await safe_load_stock()
     if category not in stock_data.get("categories", []):
         await interaction.followup.send("❌ Invalid category.", ephemeral=True)
         return
 
-    key = "FREE" if type == "free" else "EXCLUSIVE"
     new_items = []
     if file:
         try:
-            content = await file.read()
-            lines = [l.strip() for l in content.decode(errors="ignore").splitlines() if l.strip()]
+            raw = await file.read()
+            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
         except Exception:
-            await interaction.followup.send("❌ Could not read the attached file. Use a plain .txt file.", ephemeral=True)
+            await interaction.followup.send("❌ Could not read attached file. Use plain .txt.", ephemeral=True)
             return
         for line in lines:
             if line not in stock_data[key].get(category, []):
@@ -305,89 +327,164 @@ async def slash_addstock(interaction: discord.Interaction, type: str, category: 
             if line not in stock_data[key].get(category, []):
                 new_items.append(line)
     else:
-        await interaction.followup.send("❌ Provide stock via text or attach a .txt file.", ephemeral=True)
+        await interaction.followup.send("❌ Provide stock text or attach a .txt file.", ephemeral=True)
         return
 
     stock_data[key].setdefault(category, []).extend(new_items)
     await safe_save_stock()
-    await interaction.followup.send(f"✅ Added {len(new_items)} items to `{category}`.", ephemeral=True)
-    # ping role
-    role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
-    role = interaction.guild.get_role(role_id)
-    if role:
-        await interaction.channel.send(f"{role.mention} 🔔 `{category}` restocked!")
+    await interaction.followup.send(f"✅ Added {len(new_items)} new item(s) to `{category}`.", ephemeral=True)
 
-@tree.command(name="restock", description="Replace stock for a category (Admin only)")
+    # Ping restock channel
+    restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or interaction.guild.get_channel(RESTOCK_CHANNEL_ID)
+    role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
+    if restock_channel:
+        await restock_channel.send(f"<@&{role_id}> 🔔 `{category}` was restocked ({len(new_items)} new item(s)).")
+
+@tree.command(name="removestock", description="Remove stock items (Admin only)")
+@is_admin_check()
 @app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
-@app_commands.check(admin_check_predicate)
-async def slash_restock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str] = None, file: Optional[discord.Attachment] = None):
+async def cmd_removestock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str] = None, file: Optional[discord.Attachment] = None):
     await interaction.response.defer(ephemeral=True)
-    type = type.lower()
-    if type not in ("free", "exclusive"):
+    t = type.lower()
+    if t not in ("free", "exclusive"):
         await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
         return
+    key = "FREE" if t == "free" else "EXCLUSIVE"
     await safe_load_stock()
     if category not in stock_data.get("categories", []):
         await interaction.followup.send("❌ Invalid category.", ephemeral=True)
         return
 
-    key = "FREE" if type == "free" else "EXCLUSIVE"
-    items = []
+    removed = 0
     if file:
         try:
-            content = await file.read()
-            lines = [l.strip() for l in content.decode(errors="ignore").splitlines() if l.strip()]
+            raw = await file.read()
+            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
         except Exception:
-            await interaction.followup.send("❌ Could not read the attached file. Use a plain .txt file.", ephemeral=True)
+            await interaction.followup.send("❌ Could not read attached file. Use plain .txt.", ephemeral=True)
             return
-        items = list(dict.fromkeys(lines))
+        for line in lines:
+            if line in stock_data[key].get(category, []):
+                while line in stock_data[key][category]:
+                    stock_data[key][category].remove(line)
+                    removed += 1
     elif stock:
         lines = [l.strip() for l in stock.splitlines() if l.strip()]
-        items = list(dict.fromkeys(lines))
+        for line in lines:
+            if line in stock_data[key].get(category, []):
+                while line in stock_data[key][category]:
+                    stock_data[key][category].remove(line)
+                    removed += 1
     else:
-        await interaction.followup.send("❌ Provide stock via text or attach a .txt file.", ephemeral=True)
+        await interaction.followup.send("❌ Provide items to remove via text or attach a .txt file.", ephemeral=True)
         return
 
-    stock_data[key][category] = items
     await safe_save_stock()
-    await interaction.followup.send(f"♻️ `{category}` restocked with {len(items)} items.", ephemeral=True)
-    role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
-    role = interaction.guild.get_role(role_id)
-    if role:
-        await interaction.channel.send(f"{role.mention} 🚀 `{category}` fully restocked!")
+    await interaction.followup.send(f"✅ Removed {removed} item(s) from `{category}`.", ephemeral=True)
 
-# ---------------- REDEEM MODAL ----------------
+@tree.command(name="restock", description="Replace stock for a category (Admin only)")
+@is_admin_check()
+@app_commands.autocomplete(type=type_autocomplete, category=category_autocomplete)
+async def cmd_restock(interaction: discord.Interaction, type: str, category: str, stock: Optional[str] = None, file: Optional[discord.Attachment] = None):
+    await interaction.response.defer(ephemeral=True)
+    t = type.lower()
+    if t not in ("free", "exclusive"):
+        await interaction.followup.send("❌ Type must be `free` or `exclusive`.", ephemeral=True)
+        return
+    key = "FREE" if t == "free" else "EXCLUSIVE"
+    await safe_load_stock()
+    if category not in stock_data.get("categories", []):
+        await interaction.followup.send("❌ Invalid category.", ephemeral=True)
+        return
+
+    new_items = []
+    if file:
+        try:
+            raw = await file.read()
+            lines = [l.strip() for l in raw.decode(errors="ignore").splitlines() if l.strip()]
+            new_items = list(dict.fromkeys(lines))
+        except Exception:
+            await interaction.followup.send("❌ Could not read attached file. Use plain .txt.", ephemeral=True)
+            return
+    elif stock:
+        lines = [l.strip() for l in stock.splitlines() if l.strip()]
+        new_items = list(dict.fromkeys(lines))
+    else:
+        await interaction.followup.send("❌ Provide stock text or attach a .txt file.", ephemeral=True)
+        return
+
+    stock_data[key][category] = new_items
+    await safe_save_stock()
+    await interaction.followup.send(f"♻️ `{category}` fully restocked with {len(new_items)} item(s).", ephemeral=True)
+
+    restock_channel = bot.get_channel(RESTOCK_CHANNEL_ID) or interaction.guild.get_channel(RESTOCK_CHANNEL_ID)
+    role_id = FREE_GEN_ROLE_ID if key == "FREE" else EXCLUSIVE_ROLE_ID
+    if restock_channel:
+        await restock_channel.send(f"<@&{role_id}> 🚀 `{category}` fully restocked with {len(new_items)} item(s).")
+
+# ---------------- VERIFY (custom status -> grant Free role) ----------------
+@tree.command(name="verify", description="Verify your custom status and receive Free Gen role")
+async def cmd_verify(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    member = interaction.user
+    # check custom activity
+    correct = False
+    for act in getattr(member, "activities", []):
+        if isinstance(act, discord.CustomActivity) and act.name:
+            if PRESENCE_TEXT.lower() in act.name.lower():
+                correct = True
+                break
+    if not correct:
+        await interaction.followup.send(
+            ("❌ Verification failed. Your custom status must include:\n"
+             f"`{PRESENCE_TEXT}`\n\n"
+             "Set that, then run `/verify` again."),
+            ephemeral=True
+        )
+        return
+    role = interaction.guild.get_role(FREE_GEN_ROLE_ID)
+    try:
+        if role and role not in member.roles:
+            await member.add_roles(role)
+        await interaction.followup.send("✅ Verification successful — Free Gen role granted.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("⚠️ Could not assign role. Check bot permissions.", ephemeral=True)
+
+# ---------------- REDEEM EXCLUSIVE (modal) ----------------
 class RedeemModal(discord.ui.Modal, title="Redeem Exclusive Gift Card"):
-    payment_type = discord.ui.TextInput(label="Payment Type", placeholder="Paypal / CashApp / Giftcard")
-    code = discord.ui.TextInput(label="Code", placeholder="Paste the code here")
+    payment_type = discord.ui.TextInput(label="Payment Type", placeholder="e.g. PayPal, CashApp, Gift Card")
+    code = discord.ui.TextInput(label="Redeem Code", placeholder="Paste the redeem code here")
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         try:
             staff = await bot.fetch_user(STAFF_NOTIFY_USER_ID)
-            await staff.send(f"Redeem request:\nUser: {interaction.user}\nPayment: {self.payment_type.value}\nCode: `{self.code.value}`")
+            await staff.send(
+                f"🔔 Redeem Request\nUser: {interaction.user} ({interaction.user.id})\n"
+                f"Payment Type: {self.payment_type.value}\nCode: `{self.code.value}`"
+            )
         except Exception:
             pass
-        await interaction.followup.send("✅ Submitted. Staff will verify and grant Exclusive if valid.", ephemeral=True)
+        await interaction.followup.send("✅ Your code has been submitted for verification. Staff will handle it shortly.", ephemeral=True)
 
-@tree.command(name="redeem-exclusive", description="Redeem Exclusive via gift card")
-async def slash_redeem(interaction: discord.Interaction):
+@tree.command(name="redeem-exclusive", description="Redeem Exclusive access via gift card")
+async def cmd_redeem(interaction: discord.Interaction):
     await interaction.response.send_modal(RedeemModal())
 
-# ---------------- ADMIN: RESYNC COMMANDS (manual, with cooldown) ----------------
-@tree.command(name="resync-commands", description="(Admin) Sync slash commands to the guild (use only if needed)")
-@app_commands.check(admin_check_predicate)
-async def slash_resync(interaction: discord.Interaction):
-    global _last_resync
+# ---------------- ADMIN: RESYNC COMMANDS (manual, safe) ----------------
+@tree.command(name="resync-commands", description="(Admin) Register/sync commands to the guild (use only when needed)")
+@is_admin_check()
+async def cmd_resync(interaction: discord.Interaction):
+    global _last_resync_ts
     await interaction.response.defer(ephemeral=True)
     now = now_ts()
-    if now - _last_resync < _RESYNC_COOLDOWN:
+    if now - _last_resync_ts < RESYNC_COOLDOWN:
         await interaction.followup.send("❌ Commands were resynced recently. Wait before running again to avoid rate limits.", ephemeral=True)
         return
     try:
-        guild = discord.Object(id=GUILD_ID)
-        await tree.sync(guild=guild)
-        _last_resync = now_ts()
+        guild_obj = discord.Object(id=GUILD_ID)
+        await tree.sync(guild=guild_obj)
+        _last_resync_ts = now_ts()
         await interaction.followup.send("✅ Commands synced to guild.", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send("❌ Missing access when syncing commands. Ensure bot has applications.commands scope & is in guild.", ephemeral=True)
@@ -398,9 +495,8 @@ async def slash_resync(interaction: discord.Interaction):
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
-        print("[ERROR] TOKEN env var not set. Set TOKEN to your bot token and restart.")
+        print("[ERROR] TOKEN environment variable not set. Set TOKEN and restart.")
     else:
-        # make sure stock file exists and in-memory is loaded
-        _ensure_stock()
-        stock_data = load_stock()
+        ensure_stock_file()
+        stock_data = load_stock_from_disk()
         bot.run(TOKEN)
